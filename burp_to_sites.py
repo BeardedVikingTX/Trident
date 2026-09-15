@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-#  TRIDENT :: burp_to_sites.py — v1.0.1
-#  Convert Burp Suite URL exports into the workspace/<host>/<slug>.json
-#  format that the TRIDENT scanners consume.
+#  TRIDENT :: burp_to_sites.py — v2.0.0
+#  Import Burp Suite URL dumps into the TRIDENT workspace format.
 # -----------------------------------------------------------------------------
-#  v1.0.1 fixes:
-#    · Throttle no longer sleeps inside its lock — no more apparent freeze
-#    · Fetch failures STILL write a .json (with _error set) — URLs never lost
-#    · URL JSON is written to disk BEFORE any AI call — AI can hang safely
-#    · AI enrichment updates the JSON in place, second-pass safe
-#    · Connect timeout is now 5s; read timeout configurable (default 15s)
-#    · Progress printed every 10 URLs — no more silent running
-#    · --ai-timeout flag (default 30s) for AI enrichment calls
-# -----------------------------------------------------------------------------
-#  AI behavior:
-#    AI keys present → enrich each page with ai_recon
-#    AI keys absent  → URL is still fetched and saved, just no ai_recon
-#    AI hangs        → URL is saved, _ai.ok=false, scanner proceeds
+#  Design goals:
+#    · FAST      — 40 workers, no throttle by default, 3s connect timeout
+#    · RELIABLE  — every URL gets a .json, even on catastrophic failure
+#    · SAFE      — write to disk BEFORE any AI call
+#    · OPTIONAL  — AI is a second pass, never blocks the fetch
+#    · FAMILIAR  — same output shape as HUGINN's v3.1 importer
+#
+#  Output format (per URL):
+#      workspace/sites/<host>/<slug>.json
+#      {
+#        "url": ..., "status": ..., "method": ..., "content_type": ...,
+#        "content_length": ..., "title": ..., "params": [...],
+#        "headers": {...}, "cookies": {...}, "content": "...",
+#        "_source": "burp", "_fetched_at": "...",
+#        "_fetch": {"authenticated": bool, "header_names": [...], "timestamp": ...},
+#        "_ai":    {"enabled": bool, "ok": bool, ...}     # always present
+#        "ai_recon": {...}                                 # if AI ran
+#      }
+#
+#  Circuit breaker: hosts failing HOST_DEAD_AFTER times in a row are
+#  skipped for the rest of the run. Kills the "1h27m ETA" problem.
 # =============================================================================
 
 import argparse
@@ -73,19 +80,25 @@ PRESETS = {
             r"/(api|v[0-9]+|graphql|rest|oauth|auth|admin|"
             r"user|account|billing|payment|login|session)"
         ),
-        "exclude_path": r"\.(js|mjs|css|map|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2|ttf|otf|eot)$",
+        "exclude_path": (
+            r"\.(js|mjs|css|map|png|jpg|jpeg|gif|svg|webp|ico|"
+            r"woff|woff2|ttf|otf|eot)$"
+        ),
     },
     "api-only": {
         "description": "Only /api/ /v1/ /graphql paths",
         "include_path": r"/(api|v[0-9]+|graphql|rest)/",
     },
-    "none": {"description": "No automatic filtering — raw import"},
+    "none": {
+        "description": "No automatic filtering — raw import",
+    },
 }
 
 STATIC_EXTENSIONS = re.compile(
     r"\.(js|mjs|css|map|png|jpg|jpeg|gif|svg|webp|ico|bmp|"
     r"woff|woff2|ttf|otf|eot|mp4|webm|mp3|wav|ogg|ogv|"
-    r"pdf|zip|tar|gz|7z|rar|exe|dll|so|bin)$", re.I,
+    r"pdf|zip|tar|gz|7z|rar|exe|dll|so|bin)$",
+    re.I,
 )
 
 TRACKING_PARAMS = {
@@ -97,14 +110,20 @@ TRACKING_PARAMS = {
     "cache_buster", "_", "cb", "ts", "timestamp", "_t", "_ts",
 }
 
-MAX_BODY_BYTES     = 500_000
-FETCH_TIMEOUT      = 15
-CONNECT_TIMEOUT    = 5
-DEFAULT_DELAY      = 0.2
-DEFAULT_WORKERS    = 8
-DEFAULT_AI_WORKERS = 2
-DEFAULT_AI_TIMEOUT = 30
-PROGRESS_EVERY     = 10
+
+# =============================================================================
+#  CONFIG
+# =============================================================================
+MAX_BODY_BYTES      = 500_000
+FETCH_TIMEOUT       = 10         # read timeout
+CONNECT_TIMEOUT     = 3          # TCP connect timeout
+DEFAULT_DELAY       = 0.0        # no throttle by default
+DEFAULT_WORKERS     = 20
+DEFAULT_AI_WORKERS  = 2
+DEFAULT_AI_TIMEOUT  = 30
+PROGRESS_EVERY      = 25
+HOST_DEAD_AFTER     = 5          # consecutive failures → skip host
+HOST_DEAD_COOLDOWN  = 120        # seconds before retrying a dead host
 
 AUTH_HEADER_NAMES = {
     "authorization", "cookie", "x-api-key", "x-auth-token",
@@ -114,10 +133,10 @@ AUTH_HEADER_NAMES = {
 
 
 # =============================================================================
-#  AI CLIENT
+#  AI CLIENT — multi-provider, auto-detects from .env
 # =============================================================================
 class AIClient:
-    """Multi-provider chat client. Auto-detects provider from .env."""
+    """Self-contained chat client. Picks provider via trident_utils.pick_provider()."""
 
     def __init__(self, prefer=None, timeout=DEFAULT_AI_TIMEOUT, max_tokens=1200):
         self.timeout = timeout
@@ -178,8 +197,8 @@ class AIClient:
             body["response_format"] = {"type": "json_object"}
         headers = {"Authorization": f"Bearer {self.key}",
                    "Content-Type": "application/json"}
-        r = send_request(url, method="POST", headers=headers,
-                         json_body=body, timeout=self.timeout)
+        r = send_request(url, method="POST", headers=headers, json_body=body,
+                         timeout=self.timeout, retry=False)
         if r is None or r.status_code >= 400:
             self._bump(False)
             return None, {}
@@ -190,12 +209,15 @@ class AIClient:
         return text, u
 
     def _gemini(self, sp, up, jm):
-        url = f"{AI_PROVIDERS['gemini']['base_url']}/models/{self.model}:generateContent?key={self.key}"
+        url = (f"{AI_PROVIDERS['gemini']['base_url']}/models/{self.model}"
+               f":generateContent?key={self.key}")
         body = {"contents": [{"role": "user", "parts": [{"text": sp + "\n\n" + up}]}],
-                "generationConfig": {"temperature": 0.15, "maxOutputTokens": self.max_tokens}}
+                "generationConfig": {"temperature": 0.15,
+                                      "maxOutputTokens": self.max_tokens}}
         if jm:
             body["generationConfig"]["responseMimeType"] = "application/json"
-        r = send_request(url, method="POST", json_body=body, timeout=self.timeout)
+        r = send_request(url, method="POST", json_body=body,
+                         timeout=self.timeout, retry=False)
         if r is None or r.status_code >= 400:
             self._bump(False)
             return None, {}
@@ -215,7 +237,7 @@ class AIClient:
         body = {"model": self.model, "max_tokens": self.max_tokens,
                 "system": sp, "messages": [{"role": "user", "content": up}]}
         r = send_request(url, method="POST", headers=headers, json_body=body,
-                         timeout=self.timeout)
+                         timeout=self.timeout, retry=False)
         if r is None or r.status_code >= 400:
             self._bump(False)
             return None, {}
@@ -233,7 +255,7 @@ class AIClient:
                 "parameters": {"max_new_tokens": self.max_tokens,
                                 "temperature": 0.15, "return_full_text": False}}
         r = send_request(url, method="POST", headers=headers, json_body=body,
-                         timeout=self.timeout)
+                         timeout=self.timeout, retry=False)
         if r is None or r.status_code >= 400:
             self._bump(False)
             return None, {}
@@ -253,7 +275,8 @@ class AIClient:
                 "stream": False, "options": {"temperature": 0.15}}
         if jm:
             body["format"] = "json"
-        r = send_request(url, method="POST", json_body=body, timeout=self.timeout)
+        r = send_request(url, method="POST", json_body=body,
+                         timeout=self.timeout, retry=False)
         if r is None or r.status_code >= 400:
             self._bump(False)
             return None, {}
@@ -278,7 +301,7 @@ class AIClient:
                                          "content-security-policy", "x-csrf-token")}
 
         system = ("You are a bug bounty reconnaissance analyst. Output "
-                  "STRICT JSON only describing the page's attack surface.")
+                  "STRICT JSON describing the page's attack surface. No prose.")
         user = f"""Analyze this HTTP page for bug bounty recon.
 
 URL: {url}
@@ -369,11 +392,12 @@ def parse_url_line(line):
 def load_urls(path, filter_pattern=None, include_host=None,
               exclude_host=None, include_path=None, exclude_path=None):
     urls, seen = [], set()
-    rx_f = re.compile(filter_pattern) if filter_pattern else None
-    rx_ih = re.compile(include_host) if include_host else None
-    rx_eh = re.compile(exclude_host) if exclude_host else None
-    rx_ip = re.compile(include_path) if include_path else None
-    rx_ep = re.compile(exclude_path) if exclude_path else None
+    rx_f  = re.compile(filter_pattern) if filter_pattern else None
+    rx_ih = re.compile(include_host)   if include_host   else None
+    rx_eh = re.compile(exclude_host)   if exclude_host   else None
+    rx_ip = re.compile(include_path)   if include_path   else None
+    rx_ep = re.compile(exclude_path)   if exclude_path   else None
+
     stats = {"read": 0, "invalid": 0, "filtered_url": 0,
              "filtered_host": 0, "filtered_path": 0, "dupes": 0, "kept": 0}
 
@@ -442,7 +466,7 @@ def is_static_url(url):
 
 
 # =============================================================================
-#  HTTP FETCH
+#  HTTP
 # =============================================================================
 def _categorize_error(exc_type_name, msg):
     m = (msg or "").lower()
@@ -463,10 +487,11 @@ def describe_fetch_headers(merged):
 
 
 def fetch_page(url, timeout=FETCH_TIMEOUT, extra_headers=None):
-    """Fetch a URL. Returns (record, err). record is None only on catastrophic failure."""
+    """Fetch a URL. Retry is OFF — dead hosts fail fast."""
     try:
         r = send_request(url, timeout=(CONNECT_TIMEOUT, timeout),
-                         allow_redirects=True, headers=extra_headers)
+                         allow_redirects=True, headers=extra_headers,
+                         retry=False)
     except Exception as e:
         return None, _categorize_error(type(e).__name__, str(e))
     if r is None:
@@ -542,12 +567,74 @@ def error_page(url, reason):
 
 
 # =============================================================================
+#  THROTTLE  — sleeps OUTSIDE the lock, non-blocking for other hosts
+# =============================================================================
+class HostThrottle:
+    def __init__(self, delay):
+        self.delay = delay
+        self._last = {}
+        self._lock = threading.Lock()
+
+    def wait(self, host):
+        if self.delay <= 0 or not host:
+            return
+        while True:
+            with self._lock:
+                now = time.time()
+                last = self._last.get(host, 0.0)
+                w = self.delay - (now - last)
+                if w <= 0:
+                    self._last[host] = now
+                    return
+            time.sleep(min(w, 0.25))
+
+
+# =============================================================================
+#  CIRCUIT BREAKER  — skip dead hosts entirely
+# =============================================================================
+class HostCircuitBreaker:
+    def __init__(self, limit=HOST_DEAD_AFTER, cooldown=HOST_DEAD_COOLDOWN):
+        self.limit = limit
+        self.cooldown = cooldown
+        self._fail = {}
+        self._dead_at = {}
+        self._success = {}
+        self._lock = threading.Lock()
+
+    def is_dead(self, host):
+        with self._lock:
+            if self._fail.get(host, 0) < self.limit:
+                return False
+            # Cooldown: allow one probe every N seconds
+            if time.time() - self._dead_at.get(host, 0) > self.cooldown:
+                self._fail[host] = self.limit - 1  # allow one retry
+                return False
+            return True
+
+    def record(self, host, ok):
+        with self._lock:
+            if ok:
+                self._fail[host] = 0
+                self._success[host] = self._success.get(host, 0) + 1
+            else:
+                self._fail[host] = self._fail.get(host, 0) + 1
+                if self._fail[host] >= self.limit:
+                    self._dead_at[host] = time.time()
+
+    def dead_hosts(self):
+        with self._lock:
+            return {h: self._fail[h] for h in self._fail
+                    if self._fail[h] >= self.limit}
+
+
+# =============================================================================
 #  STATS
 # =============================================================================
 class FetchStats:
     def __init__(self, total):
         self.total = total
         self.written = self.failed = self.skipped = self.refreshed = 0
+        self.dead_skipped = 0
         self.ai_done = self.ai_failed = self.ai_skipped = 0
         self.ai_interesting = 0
         self.ai_by_kind, self.ai_by_priority, self.ai_scanner_hits = {}, {}, {}
@@ -586,10 +673,12 @@ class FetchStats:
                 "total": self.total,
                 "written": self.written, "failed": self.failed,
                 "skipped": self.skipped, "refreshed": self.refreshed,
+                "dead_skipped": self.dead_skipped,
                 "authenticated": self.authenticated,
                 "unauthenticated": self.unauthenticated,
                 "ai_done": self.ai_done, "ai_failed": self.ai_failed,
-                "ai_skipped": self.ai_skipped, "ai_interesting": self.ai_interesting,
+                "ai_skipped": self.ai_skipped,
+                "ai_interesting": self.ai_interesting,
                 "ai_by_kind": dict(self.ai_by_kind),
                 "ai_by_priority": dict(self.ai_by_priority),
                 "ai_scanner_hits": dict(self.ai_scanner_hits),
@@ -599,36 +688,12 @@ class FetchStats:
 
 
 # =============================================================================
-#  THROTTLE  — sleeps OUTSIDE the lock (v1.0.1 fix)
-# =============================================================================
-class HostThrottle:
-    def __init__(self, delay):
-        self.delay = delay
-        self._last = {}
-        self._lock = threading.Lock()
-
-    def wait(self, host):
-        if self.delay <= 0 or not host:
-            return
-        while True:
-            with self._lock:
-                now = time.time()
-                last = self._last.get(host, 0.0)
-                w = self.delay - (now - last)
-                if w <= 0:
-                    self._last[host] = now
-                    return
-            # Sleep outside the lock — other hosts are free to proceed
-            time.sleep(min(w, 0.25))
-
-
-# =============================================================================
-#  WORKER  — always saves; AI is optional second pass
+#  WORKER
 # =============================================================================
 def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
                  header_jar, fallback_headers, no_fetch, refresh,
                  ai_client, ai_semaphore, ai_force, ai_skip_static,
-                 stats, out_lock, quiet):
+                 stats, out_lock, quiet, circuit):
 
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -638,6 +703,11 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
     except Exception as e:
         stats.record_error(f"mkdir:{type(e).__name__}")
         return url, 0, "error:mkdir"
+
+    # ---- Circuit breaker: bail fast on dead hosts ---------------------
+    if not no_fetch and circuit.is_dead(host):
+        stats.bump("dead_skipped")
+        return url, 0, "skipped_dead"
 
     slug = slug_for_url(url)
     with used_slugs_lock:
@@ -649,9 +719,8 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
 
     out_path = host_dir / f"{slug}.json"
 
-    # ---- Resume / cache check ------------------------------------------
+    # ---- Resume / cache check -----------------------------------------
     record = None
-    skip_fetch = False
     if out_path.exists() and not refresh:
         try:
             record = load_json(out_path)
@@ -662,13 +731,11 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
             if not needs_ai:
                 stats.bump("skipped")
                 return url, record.get("status", 0), "skipped"
-            skip_fetch = True
-            if not quiet:
-                log(f"  ~ [cached, AI-pending] {url[:110]}", "info")
         except Exception:
             record = None
 
-    # ---- Fetch (if needed) ---------------------------------------------
+    # ---- Fetch (if needed) --------------------------------------------
+    outcome = "ok"
     if record is None:
         if header_jar is not None:
             merged_headers = header_jar.headers_for(url)
@@ -683,11 +750,12 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
             throttle.wait(host)
             record, err = fetch_page(url, extra_headers=merged_headers)
             if record is None:
-                # Do NOT lose the URL — write a record with _error set
                 stats.record_error(err or "unknown")
+                circuit.record(host, ok=False)
                 record = error_page(url, err or "unknown")
                 outcome = f"error:{err or 'unknown'}"
             else:
+                circuit.record(host, ok=True)
                 outcome = "ok"
 
         record["_fetch"] = {
@@ -699,7 +767,7 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
         if refresh and out_path.exists():
             stats.bump("refreshed")
 
-        # ---- SAVE NOW — before any AI call ----------------------------
+        # ---- SAVE NOW, before any AI call -----------------------------
         try:
             with out_lock:
                 save_json(out_path, record)
@@ -708,7 +776,7 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
             stats.record_error(f"save:{type(e).__name__}")
             return url, record.get("status", 0), "error:save"
 
-    # ---- AI recon (second pass, safe to fail) --------------------------
+    # ---- AI recon (second pass, safe to fail) -------------------------
     if ai_client is not None and ai_client.available() and ai_semaphore is not None:
         skip_ai = False
         if ai_skip_static and is_static_url(url):
@@ -729,7 +797,7 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
             except Exception as e:
                 if not quiet:
                     log(f"AI error for {url[:80]}: {type(e).__name__}: {e}",
-                        "warn")
+                        "warn", "AI")
             dur_ms = int((time.time() - t0) * 1000)
 
             record["_ai"] = {
@@ -747,7 +815,6 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
             else:
                 stats.bump("ai_failed")
 
-            # Persist the enriched record — best-effort
             try:
                 with out_lock:
                     save_json(out_path, record)
@@ -770,7 +837,7 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
                 except Exception:
                     pass
     else:
-        # No AI available — record the fact, don't touch disk (already saved)
+        # No AI — stamp the record if it hasn't been already
         if "_ai" not in record:
             record["_ai"] = {
                 "enabled": False,
@@ -783,7 +850,7 @@ def fetch_worker(url, workspace, used_slugs, used_slugs_lock, throttle,
             except Exception:
                 pass
 
-    return url, record.get("status", 0), outcome if record else "ok"
+    return url, record.get("status", 0), outcome
 
 
 # =============================================================================
@@ -837,25 +904,25 @@ def print_ai_summary(stats, ai_client):
     if not (snap["ai_done"] or snap["ai_failed"] or snap["ai_skipped"]):
         return
     section("AI RECON SUMMARY")
-    log(f"provider      : {ai_client.label} / {ai_client.model}", "info")
-    log(f"analyzed      : {snap['ai_done']} pages", "ok")
+    log(f"provider      : {ai_client.label} / {ai_client.model}", "info", "AI")
+    log(f"analyzed      : {snap['ai_done']} pages", "ok", "AI")
     if snap["ai_interesting"]:
         pct = 100.0 * snap["ai_interesting"] / max(1, snap["ai_done"])
-        log(f"interesting   : {snap['ai_interesting']} ({pct:.0f}%)", "info")
+        log(f"interesting   : {snap['ai_interesting']} ({pct:.0f}%)", "info", "AI")
     if snap["ai_skipped"]:
-        log(f"skipped       : {snap['ai_skipped']} (static or cached)", "info")
+        log(f"skipped       : {snap['ai_skipped']} (static or cached)", "info", "AI")
     if snap["ai_failed"]:
-        log(f"failed        : {snap['ai_failed']}", "warn")
+        log(f"failed        : {snap['ai_failed']}", "warn", "AI")
     if snap["ai_by_priority"]:
         p = snap["ai_by_priority"]
         log(f"by priority   : high={p.get('high', 0)} "
-            f"medium={p.get('medium', 0)} low={p.get('low', 0)}", "info")
+            f"medium={p.get('medium', 0)} low={p.get('low', 0)}", "info", "AI")
     if snap["ai_scanner_hits"]:
         s = sorted(snap["ai_scanner_hits"].items(), key=lambda x: -x[1])
-        log("scanner hints : " + "  ".join(f"{n}={c}" for n, c in s[:8]), "info")
+        log("scanner hints : " + "  ".join(f"{n}={c}" for n, c in s[:8]), "info", "AI")
     st = ai_client.stats
     log(f"usage         : {st['calls']} calls ({st['ok']} ok / {st['failed']} fail) "
-        f"tokens {st['tokens_in']}/{st['tokens_out']}", "info")
+        f"tokens {st['tokens_in']}/{st['tokens_out']}", "info", "AI")
 
 
 def write_ai_index(workspace, results):
@@ -868,14 +935,14 @@ def write_ai_index(workspace, results):
     ))
     for r in results:
         index["pages"].append({
-            "url": r.get("url", ""),
-            "kind": r.get("kind", ""),
-            "priority": r.get("priority", ""),
-            "interesting": r.get("interesting", False),
-            "confidence": r.get("confidence", 0.0),
-            "attack_surface": r.get("attack_surface", []),
+            "url":                r.get("url", ""),
+            "kind":               r.get("kind", ""),
+            "priority":           r.get("priority", ""),
+            "interesting":        r.get("interesting", False),
+            "confidence":         r.get("confidence", 0.0),
+            "attack_surface":     r.get("attack_surface", []),
             "suggested_scanners": r.get("suggested_scanners", []),
-            "notes": r.get("notes", ""),
+            "notes":              r.get("notes", ""),
         })
     save_json(workspace / "_ai_recon_index.json", index)
     return len(index["pages"])
@@ -886,14 +953,21 @@ def write_ai_index(workspace, results):
 # =============================================================================
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="Burp URLs → TRIDENT workspace (auth-aware, AI-optional)",
+        description="TRIDENT :: Burp URLs → workspace (fast, reliable, AI-optional)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-AI auto-selection order (first usable wins):
+Presets:
+  bugbounty  Skips CDNs, static assets, third-party hosts (DEFAULT)
+  strict     Only API-like endpoints
+  api-only   Only /api/ /v1/ /graphql paths
+  none       No automatic filtering — raw import
+
+AI auto-selection (first usable wins):
   groq → gemini → deepseek → openai → anthropic → huggingface → ollama
 
 Examples:
   python3 burp_to_sites.py urls.txt workspace/
+  python3 burp_to_sites.py urls.txt workspace/ --fast
   python3 burp_to_sites.py urls.txt workspace/ --ai
   python3 burp_to_sites.py urls.txt workspace/ --ai --ai-provider groq
   python3 burp_to_sites.py urls.txt workspace/ --no-auth
@@ -903,9 +977,10 @@ Examples:
   python3 burp_to_sites.py urls.txt workspace/ --stats-only
 """,
     )
-    ap.add_argument("urls_file")
-    ap.add_argument("workspace")
+    ap.add_argument("urls_file", help="text file with one URL per line")
+    ap.add_argument("workspace", help="workspace directory to create")
 
+    # Filtering
     ap.add_argument("--preset", choices=list(PRESETS.keys()), default="bugbounty")
     ap.add_argument("--filter", default=None)
     ap.add_argument("--include-host", default=None)
@@ -914,28 +989,33 @@ Examples:
     ap.add_argument("--exclude-path", default=None)
     ap.add_argument("--no-cdn", action="store_true")
 
+    # Behavior
     ap.add_argument("--no-fetch", action="store_true",
-                    help="register URLs without fetching (saves with status=0)")
+                    help="register URLs without fetching (still saves JSON)")
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--stats-only", action="store_true")
+    ap.add_argument("--fast", action="store_true",
+                    help="fast mode: 40 workers, no delay, 6s read timeout, no AI")
     ap.add_argument("--delay", type=float, default=DEFAULT_DELAY)
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
-    ap.add_argument("--timeout", type=int, default=FETCH_TIMEOUT,
-                    help=f"per-request read timeout in seconds (default {FETCH_TIMEOUT})")
+    ap.add_argument("--timeout", type=int, default=FETCH_TIMEOUT)
+    ap.add_argument("--dead-after", type=int, default=HOST_DEAD_AFTER,
+                    help=f"consecutive failures before host is skipped (default {HOST_DEAD_AFTER})")
     ap.add_argument("-q", "--quiet", action="store_true")
 
+    # Auth
     ap.add_argument("--headers-dir", default=None)
     ap.add_argument("--no-auth", action="store_true")
     ap.add_argument("--cookie", default=None)
     ap.add_argument("--header", action="append", default=[])
 
+    # AI
     ap.add_argument("--ai", action="store_true",
                     help="enable AI page reconnaissance")
     ap.add_argument("--ai-provider", default=None)
     ap.add_argument("--ai-workers", type=int, default=DEFAULT_AI_WORKERS)
-    ap.add_argument("--ai-timeout", type=int, default=DEFAULT_AI_TIMEOUT,
-                    help=f"per-call AI timeout (default {DEFAULT_AI_TIMEOUT}s)")
+    ap.add_argument("--ai-timeout", type=int, default=DEFAULT_AI_TIMEOUT)
     ap.add_argument("--ai-force", action="store_true")
     ap.add_argument("--ai-skip-static", action="store_true")
 
@@ -977,6 +1057,14 @@ def parse_extra_headers(cookie, header_list):
 def main():
     ap = build_parser()
     args = ap.parse_args()
+
+    # --fast shortcut
+    if args.fast:
+        args.workers = 40
+        args.delay = 0.0
+        args.timeout = 6
+        args.ai = False
+        log("fast mode: workers=40 delay=0 timeout=6s ai=off", "warn")
 
     urls_file = Path(args.urls_file)
     if not urls_file.exists():
@@ -1078,53 +1166,54 @@ def main():
 
     env_path = find_env_file()
     if env_path:
-        log(f".env         : {env_path}", "info")
+        log(f".env         : {env_path}", "info", "AI")
     else:
-        log(".env         : not found (checking os.environ only)", "info")
+        log(".env         : not found (checking os.environ only)", "info", "AI")
 
     env = load_env()
     rows = provider_summary(env)
     usable_names = [r["provider"] for r in rows if r["usable"]]
     for r in rows:
         icon = "ready" if r["usable"] else "--"
-        log(f"  {r['label']:<14} {icon:<6} {r['env_var'] or '(not set)'}", "info")
+        log(f"  {r['label']:<14} {icon:<6} {r['env_var'] or '(not set)'}", "info", "AI")
 
     if not args.ai:
-        log("--ai not passed → fetch-only mode", "info")
+        log("--ai not passed → fetch-only mode", "info", "AI")
     elif not usable_names:
-        log("--ai passed but NO provider key resolved", "warn")
-        log("  → add keys to .env (see env_example)", "info")
-        log("  → URLs will still be fetched and saved", "info")
+        log("--ai passed but NO provider key resolved", "warn", "AI")
+        log("  → add keys to .env (see env_example)", "info", "AI")
+        log("  → URLs will still be fetched and saved", "info", "AI")
     else:
         prefer = None
         if args.ai_provider:
             if args.ai_provider not in AI_PROVIDERS:
-                log(f"unknown provider: {args.ai_provider}", "err")
+                log(f"unknown provider: {args.ai_provider}", "err", "AI")
                 sys.exit(1)
             if args.ai_provider not in usable_names:
-                log(f"--ai-provider {args.ai_provider} has no key — auto-picking", "warn")
+                log(f"--ai-provider {args.ai_provider} has no key — auto-picking",
+                    "warn", "AI")
             else:
                 prefer = args.ai_provider
 
         try:
             ai_client = AIClient(prefer=prefer, timeout=args.ai_timeout)
         except Exception as e:
-            log(f"AI client init failed: {type(e).__name__}: {e}", "warn")
+            log(f"AI client init failed: {type(e).__name__}: {e}", "warn", "AI")
             ai_client = None
 
         if ai_client and ai_client.available():
-            log("AI recon    : ON", "ok")
-            log(f"  provider  : {ai_client.label} ({ai_client.provider})", "info")
-            log(f"  model     : {ai_client.model}", "info")
-            log(f"  workers   : {args.ai_workers}", "info")
-            log(f"  timeout   : {args.ai_timeout}s per call", "info")
+            log("AI recon    : ON", "ok", "AI")
+            log(f"  provider  : {ai_client.label} ({ai_client.provider})", "info", "AI")
+            log(f"  model     : {ai_client.model}", "info", "AI")
+            log(f"  workers   : {args.ai_workers}", "info", "AI")
+            log(f"  timeout   : {args.ai_timeout}s per call", "info", "AI")
             if args.ai_skip_static:
-                log("  skip-static: ON", "info")
+                log("  skip-static: ON", "info", "AI")
             if args.ai_force:
-                log("  force     : ON (ignore cache)", "info")
+                log("  force     : ON (ignore cache)", "info", "AI")
             ai_semaphore = threading.Semaphore(max(1, args.ai_workers))
         else:
-            log("AI client could not initialise — proceeding without AI", "warn")
+            log("AI client could not initialise — proceeding without AI", "warn", "AI")
 
     # ---- Write import metadata -----------------------------------------
     try:
@@ -1169,17 +1258,18 @@ def main():
     else:
         log(f"fetching {len(urls)} URLs "
             f"(workers={args.workers}, delay={args.delay}s/host, "
-            f"timeout={CONNECT_TIMEOUT}s connect / {args.timeout}s read)", "info")
+            f"timeout={CONNECT_TIMEOUT}s connect / {args.timeout}s read, "
+            f"dead-after={args.dead_after})", "info")
 
     used_slugs = {}
     used_slugs_lock = threading.Lock()
     throttle = HostThrottle(args.delay)
+    circuit = HostCircuitBreaker(limit=args.dead_after)
     stats = FetchStats(total=len(urls))
     out_lock = threading.Lock()
-    ai_results = []
-    ai_results_lock = threading.Lock()
 
     t0 = time.time()
+    last_progress = [0]
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
@@ -1188,13 +1278,13 @@ def main():
                 throttle, header_jar, fallback_headers,
                 args.no_fetch, args.refresh,
                 ai_client, ai_semaphore, args.ai_force, args.ai_skip_static,
-                stats, out_lock, args.quiet,
+                stats, out_lock, args.quiet, circuit,
             ): u for u in urls}
 
-            done_count = 0
+            done = 0
             for fut in as_completed(futures):
                 url = futures[fut]
-                done_count += 1
+                done += 1
                 try:
                     _, status, outcome = fut.result()
                 except Exception as e:
@@ -1205,26 +1295,30 @@ def main():
                             f"{type(e).__name__}: {e}", "warn")
                     continue
 
-                if outcome != "skipped" and outcome.startswith("error:"):
+                if outcome == "skipped_dead":
+                    pass
+                elif outcome == "skipped":
+                    if not args.quiet:
+                        log(f"  · [cached] {url[:110]}", "info")
+                elif outcome.startswith("error:"):
                     stats.bump("failed")
                     if not args.quiet:
                         log(f"  ✗ [{outcome.split(':', 1)[1]}] {url[:110]}", "warn")
-                elif outcome == "skipped":
-                    if not args.quiet:
-                        log(f"  · [skipped] {url[:110]}", "info")
                 else:
                     if not args.quiet:
-                        log(f"  ✓ [{status}] {url[:110]}",
-                            "ok", urlparse(url).netloc)
+                        log(f"  ✓ [{status}] {url[:110]}", "ok",
+                            urlparse(url).netloc)
 
-                # Progress every N
-                if done_count % PROGRESS_EVERY == 0 or done_count == len(urls):
+                # Progress
+                if done - last_progress[0] >= PROGRESS_EVERY or done == len(urls):
+                    last_progress[0] = done
                     snap = stats.snapshot()
-                    elapsed = time.time() - stats.started_at
-                    rate = done_count / elapsed if elapsed > 0 else 0
-                    eta = (len(urls) - done_count) / rate if rate > 0 else 0
-                    log(f"progress {done_count}/{len(urls)}  "
-                        f"ok={snap['written']} fail={snap['failed']} skip={snap['skipped']}  "
+                    el = time.time() - t0
+                    rate = done / el if el > 0 else 0
+                    eta = (len(urls) - done) / rate if rate > 0 else 0
+                    log(f"progress {done}/{len(urls)}  "
+                        f"ok={snap['written']} fail={snap['failed']} "
+                        f"skip={snap['skipped']} dead-skip={snap['dead_skipped']}  "
                         f"~{rate:.1f}/s  ETA {format_duration(eta)}",
                         "info", "PROG")
 
@@ -1234,7 +1328,8 @@ def main():
 
     elapsed = time.time() - t0
 
-    # ---- Collect AI results from disk for the priority index ----------
+    # ---- Collect AI index from disk -----------------------------------
+    ai_results = []
     if ai_client is not None and ai_client.available():
         try:
             for jf in (workspace / "sites").rglob("*.json"):
@@ -1248,13 +1343,13 @@ def main():
                 if ar:
                     ar2 = dict(ar)
                     ar2["url"] = rec.get("url", "")
-                    with ai_results_lock:
-                        ai_results.append(ar2)
+                    ai_results.append(ar2)
         except Exception as e:
             log(f"failed to collect AI index: {type(e).__name__}: {e}", "warn")
 
     # ---- Summary --------------------------------------------------------
     snap = stats.snapshot()
+    dead = circuit.dead_hosts()
 
     section("SUMMARY")
     log(f"workspace     : {workspace}", "ok")
@@ -1265,13 +1360,19 @@ def main():
     if snap["refreshed"]:
         log(f"pages refreshed: {snap['refreshed']}", "info")
     if snap["failed"]:
-        log(f"pages failed  : {snap['failed']} (still saved with _error)", "warn")
+        log(f"pages failed  : {snap['failed']} (saved with _error)", "warn")
+    if snap["dead_skipped"]:
+        log(f"dead-host skip: {snap['dead_skipped']} URLs skipped", "warn")
     if snap["authenticated"] or snap["unauthenticated"]:
         log(f"authenticated : {snap['authenticated']}  |  "
             f"unauthenticated : {snap['unauthenticated']}", "info")
     if snap["error_reasons"]:
         reasons = sorted(snap["error_reasons"].items(), key=lambda x: -x[1])
         log("error breakdown: " + "  ".join(f"{r}={n}" for r, n in reasons[:6]), "info")
+    if dead:
+        log(f"dead hosts    : {len(dead)} (≥{args.dead_after} consecutive failures)", "warn")
+        for h, n in sorted(dead.items(), key=lambda x: -x[1])[:10]:
+            log(f"  {h:<42} {n} failures", "info")
     log(f"elapsed       : {format_duration(elapsed)}", "info")
 
     if ai_client is not None and ai_client.available():
@@ -1280,7 +1381,8 @@ def main():
     if ai_results:
         try:
             n = write_ai_index(workspace, ai_results)
-            log(f"priority index: {n} pages  ({workspace / '_ai_recon_index.json'})", "ok")
+            log(f"priority index: {n} pages  ({workspace / '_ai_recon_index.json'})",
+                "ok", "AI")
         except Exception as e:
             log(f"failed to write priority index: {type(e).__name__}: {e}", "warn")
 
@@ -1290,6 +1392,7 @@ def main():
     except Exception:
         final = {}
     final["final_stats"] = snap
+    final["dead_hosts"] = dead
     final["completed_at"] = now_iso()
     if ai_client is not None:
         final["ai"]["usage"] = dict(ai_client.stats)
