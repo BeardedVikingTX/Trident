@@ -1,0 +1,43 @@
+# --- Secrets (NEVER commit these) ---
+.env
+.env.*
+!.env.example
+env_example
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Trident runtime output ---
+output/*
+!output/.gitkeep
+reports/*
+!reports/.gitkeep
+*.log
+*.tmp
+
+# --- Vault artifacts (keep .yaml source, ignore encoded) ---
+# Uncomment if you don't want b64/xor files in the repo:
+# payloads/*.b64
+# payloads/*.xor
+# responses/*.b64
+# responses/*.xor
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
