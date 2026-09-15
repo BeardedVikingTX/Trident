@@ -1,0 +1,17 @@
+[33mcommit a8ad7c65de81e9491a3fe3be45ef68aeb2a05cc3[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m)[m
+Author: BeardedViking <security@beardedviking.org>
+Date:   Tue Sep 15 08:42:17 2026 -0500
+
+    Fixed the Git errors
+
+[33mcommit 01370ccf5e93e973e75a260fb9f54057fd6b8c43[m
+Author: BeardedViking <security@beardedviking.org>
+Date:   Tue Sep 15 08:38:09 2026 -0500
+
+    Added the utilities for checking and investigating things to ensure Trident is good to go.
+
+[33mcommit 6419b39111deb7a66905bf237120cab28de32261[m
+Author: BeardedViking <security@beardedviking.org>
+Date:   Tue Sep 15 07:58:41 2026 -0500
+
+    FIRST_BLOOD: Started with core operations. Just a blank tree setup
